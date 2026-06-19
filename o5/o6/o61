@@ -1,0 +1,174 @@
+import time
+import dht
+from machine import Pin, ADC, PWM, UART
+
+# ===================== PIN DEFINITIONS =====================
+# DHT22 Temperature & Humidity
+dht_sensor = dht.DHT22(Pin("P0_28"))
+
+# HC-SR04 Ultrasonic Sensor
+trig = Pin("P0_29", Pin.OUT)
+echo = Pin("P1_23", Pin.IN)
+
+# MQ Gas Sensors (Analog)
+mq135_ao = ADC(Pin("P4_12"))
+mq136_ao = ADC(Pin("P4_13"))
+mq7_ao = ADC(Pin("P0_14"))
+
+# 补充缺失的数字输出引脚定义（避免 NameError）
+try:
+    mq135_do
+except NameError:
+    mq135_do = Pin("P0_30", Pin.IN, pull=Pin.PULL_DOWN)
+try:
+    mq136_do
+except NameError:
+    mq136_do = Pin("P1_21", Pin.IN, pull=Pin.PULL_DOWN)
+try:
+    mq7_do
+except NameError:
+    mq7_do = Pin("P1_2", Pin.IN, pull=Pin.PULL_DOWN)
+
+# SG90 Servo Motor
+servo = PWM(Pin("P0_10"), freq=50, duty_ns=1_500_000)
+
+# ===================== BLUETOOTH AUTO-DETECTION =====================
+bluetooth = None
+
+def init_bluetooth():
+    """尝试多个常见的 UART 引脚对，返回可用的 UART 对象或 None"""
+    # 候选引脚对列表：(tx_pin, rx_pin, 描述)
+    candidates = [
+        ("P1_8", "P1_9", "UART1 默认调试对"),
+        ("P0_12", "P0_13", "J8-9/J8-12"),
+        ("P1_16", "P1_17", "原始设计对"),
+        ("P0_22", "P0_23", "扩展对1"),
+        ("P1_0", "P1_1", "扩展对2"),
+        ("P2_0", "P2_1", "扩展对3"),
+    ]
+    
+    for tx_name, rx_name, desc in candidates:
+        try:
+            # 先释放 UART1 资源
+            try:
+                u = UART(1)
+                u.deinit()
+            except:
+                pass
+            # 尝试初始化
+            uart = UART(1, baudrate=9600, tx=Pin(tx_name), rx=Pin(rx_name),
+                        bits=8, parity=None, stop=1)
+            # 简单测试写操作（不会阻塞）
+            uart.write(b"")
+            print(f"succssece {tx_name}/{rx_name} ({desc})")
+            return uart
+        except Exception as e:
+            print(f"[蓝牙] 引脚 {tx_name}/{rx_name} 失败: {e}")
+            continue
+    print("[蓝牙] 错误：未找到任何可用的 UART 引脚对，蓝牙功能将被禁用。")
+    return None
+
+# 初始化蓝牙
+bluetooth = init_bluetooth()
+if bluetooth:
+    bluetooth.write(b"[System] Bluetooth ready.\r\n")
+
+# ===================== FUNCTION DEFINITIONS =====================
+def servo_angle(angle):
+    angle = max(0, min(180, angle))
+    pulse_ns = int(500_000 + (angle / 180) * 2_000_000)
+    servo.duty_ns(pulse_ns)
+
+def read_ultrasonic():
+    trig.value(0)
+    time.sleep_us(2)
+    trig.value(1)
+    time.sleep_us(10)
+    trig.value(0)
+    
+    timeout = 100000
+    start = time.ticks_us()
+    while echo.value() == 0 and time.ticks_us() - start < timeout:
+        pass
+    if echo.value() == 0:
+        return 0.0
+    echo_start = time.ticks_us()
+    while echo.value() == 1 and time.ticks_us() - echo_start < timeout:
+        pass
+    if echo.value() == 1:
+        return 0.0
+    echo_duration = time.ticks_us() - echo_start
+    distance = (echo_duration * 0.0343) / 2
+    return round(distance, 1) if 2 < distance < 400 else 0.0
+
+def read_gas(adc_pin):
+    adc_value = adc_pin.read_u16()
+    voltage = (adc_value / 65535) * 3.3
+    return round(voltage, 2)
+
+def bluetooth_send(data):
+    if bluetooth:
+        try:
+            bluetooth.write((data + "\r\n").encode())
+        except:
+            pass
+
+def bluetooth_receive():
+    if bluetooth and bluetooth.any():
+        try:
+            cmd = bluetooth.readline().decode().strip()
+        except:
+            return
+        if cmd and cmd.isdigit():
+            angle = int(cmd)
+            servo_angle(angle)
+            ack = f"[Bluetooth] Servo rotated to {angle} degrees"
+            print(ack)
+            bluetooth_send(ack)
+
+# ===================== SYSTEM INITIALIZATION =====================
+print("="*50)
+print("FRDM-MCXN947 Multi-Sensor System")
+print("="*50)
+servo_angle(90)
+time.sleep(1)
+if bluetooth:
+    print("蓝牙已初始化（使用自动检测的引脚）")
+else:
+    print("蓝牙不可用，跳过所有蓝牙操作")
+print("MQ sensors warming up...\n")
+
+# ===================== MAIN LOOP =====================
+while True:
+    try:
+        dht_sensor.measure()
+        temp = dht_sensor.temperature()
+        humi = dht_sensor.humidity()
+    except Exception as e:
+        temp = 0.0
+        humi = 0.0
+        print(f"DHT22 Read Error: {e}")
+
+    dist = read_ultrasonic()
+
+    mq135_v = read_gas(mq135_ao)
+    mq136_v = read_gas(mq136_ao)
+    mq7_v = read_gas(mq7_ao)
+    mq135_alarm = mq135_do.value()
+    mq136_alarm = mq136_do.value()
+    mq7_alarm = mq7_do.value()
+
+    print("="*35)
+    print(f"Temp: {temp:>5.1f} °C | Humidity: {humi:>5.1f} %")
+    print(f"Distance: {dist:>5.1f} cm")
+    print(f"AIR QUALITY: {mq135_v:>4.2f}V (Alarm: {mq135_alarm})")
+    print(f"H2S: {mq136_v:>4.2f}V (Alarm: {mq136_alarm})")
+    print(f"CO:   {mq7_v:>4.2f}V (Alarm: {mq7_alarm})")
+    print("="*35 + "\n")
+
+    data_str = f"Temp:{temp:.1f}C Hum:{humi:.1f}% Dist:{dist:.1f}cm | AIR:{mq135_v:.2f}V CO:{mq7_v:.2f}V H2S:{mq136_v:.2f}V"
+    bluetooth_send(data_str)
+
+    bluetooth_receive()
+
+    time.sleep(2)
